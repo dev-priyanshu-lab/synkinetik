@@ -11,12 +11,37 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	dnslookupService "dnslookup/service"
 )
 
 func main() {
-	cfg, err := parseConfig()
+	modeArg := ""
+	args := os.Args[1:]
+	if len(args) > 0 {
+		switch args[0] {
+		case "scan", "dnslookup", "all":
+			modeArg = args[0]
+			args = args[1:]
+		}
+	}
+
+	config, enableDNS, dnsConfigPath, mode, err := parseConfig(modeArg, args)
 	if err != nil {
 		log.Fatalf("Invalid configuration: %v", err)
+	}
+
+	if enableDNS {
+		dnsService, err := dnslookupService.New(dnsConfigPath)
+		if err != nil {
+			log.Fatalf("Failed to initialize DNS lookup service: %v", err)
+		}
+		dnsService.Start()
+		log.Printf("DNS lookup service started on %s", dnsService.Config.Address)
+	}
+
+	if mode == "dnslookup" {
+		select {}
 	}
 
 	// Setup graceful shutdown boundaries
@@ -34,18 +59,18 @@ func main() {
 	openTargets := make(chan Target, 1000)
 
 	// 1. Start stateful L7 workers
-	WorkerPool(ctx, cfg.workers, openTargets)
+	WorkerPool(ctx, config.workers, openTargets)
 
 	// 2. Start asynchronous pcap listener
 	go func() {
-		if err := ReceiverLoop(ctx, cfg.iface, cfg.listenPort, openTargets); err != nil {
+		if err := ReceiverLoop(ctx, config.iface, config.listenPort, openTargets); err != nil {
 			log.Fatalf("Receiver failed: %v", err)
 		}
 	}()
 
 	// 3. Kick off raw SYN injection
-	log.Printf("Using interface %s with source IP %s", cfg.iface, cfg.srcIP)
-	if err := SenderLoop(ctx, cfg.srcIP, cfg.targets, cfg.listenPort); err != nil {
+	log.Printf("Using interface %s with source IP %s", config.iface, config.srcIP)
+	if err := SenderLoop(ctx, config.srcIP, config.targets, config.listenPort); err != nil {
 		log.Fatalf("Sender failed: %v", err)
 	}
 
@@ -60,37 +85,60 @@ type config struct {
 	workers    int
 }
 
-func parseConfig() (config, error) {
+func parseConfig(defaultMode string, args []string) (config, bool, string, string, error) {
 	var (
-		ifaceFlag   string
-		srcIPFlag   string
-		targetsFlag string
-		listenPort  uint
-		workers     int
+		ifaceFlag     string
+		srcIPFlag     string
+		targetsFlag   string
+		listenPort    uint
+		workers       int
+		dnsLookup     bool
+		dnsConfigPath string
+		mode          string
 	)
 
-	flag.StringVar(&ifaceFlag, "iface", "", "network interface to capture on; auto-detected when omitted")
-	flag.StringVar(&srcIPFlag, "src-ip", "", "local IPv4 source address; auto-detected from -iface when omitted")
-	flag.StringVar(&targetsFlag, "targets", "8.8.8.8:53", "comma-separated IPv4 targets as host:port")
-	flag.UintVar(&listenPort, "listen-port", 44321, "local TCP source port to use for SYN packets")
-	flag.IntVar(&workers, "workers", 50, "number of TCP verification workers")
-	flag.Parse()
+	fs := flag.NewFlagSet("synkinetik", flag.ContinueOnError)
+	fs.StringVar(&ifaceFlag, "iface", "", "network interface to capture on; auto-detected when omitted")
+	fs.StringVar(&srcIPFlag, "src-ip", "", "local IPv4 source address; auto-detected from -iface when omitted")
+	fs.StringVar(&targetsFlag, "targets", "8.8.8.8:53", "comma-separated IPv4 targets as host:port")
+	fs.UintVar(&listenPort, "listen-port", 44321, "local TCP source port to use for SYN packets")
+	fs.IntVar(&workers, "workers", 50, "number of TCP verification workers")
+	fs.BoolVar(&dnsLookup, "dns-lookup", false, "start embedded DNS lookup service")
+	fs.StringVar(&dnsConfigPath, "dns-lookup-config", "dnslookup/lookup.conf", "path to DNS lookup config file")
+	fs.StringVar(&mode, "mode", "scan", "operation mode: scan, dnslookup, all")
+
+	if defaultMode == "" {
+		defaultMode = "scan"
+	}
+	mode = defaultMode
+
+	if err := fs.Parse(args); err != nil {
+		return config{}, false, "", "", err
+	}
 
 	if listenPort == 0 || listenPort > 65535 {
-		return config{}, fmt.Errorf("-listen-port must be between 1 and 65535")
+		return config{}, false, "", mode, fmt.Errorf("-listen-port must be between 1 and 65535")
 	}
 	if workers < 1 {
-		return config{}, fmt.Errorf("-workers must be at least 1")
+		return config{}, false, "", mode, fmt.Errorf("-workers must be at least 1")
 	}
 
 	targets, err := parseTargets(targetsFlag)
 	if err != nil {
-		return config{}, err
+		return config{}, false, "", mode, err
 	}
 
 	iface, srcIP, err := resolveInterfaceAndSourceIP(ifaceFlag, srcIPFlag)
 	if err != nil {
-		return config{}, err
+		return config{}, false, "", mode, err
+	}
+
+	if mode != "scan" && mode != "dnslookup" && mode != "all" {
+		return config{}, false, "", mode, fmt.Errorf("invalid mode %q: must be scan, dnslookup, or all", mode)
+	}
+
+	if mode == "dnslookup" || mode == "all" {
+		dnsLookup = true
 	}
 
 	return config{
@@ -99,7 +147,7 @@ func parseConfig() (config, error) {
 		listenPort: uint16(listenPort),
 		targets:    targets,
 		workers:    workers,
-	}, nil
+	}, dnsLookup, dnsConfigPath, mode, nil
 }
 
 func parseTargets(raw string) ([]Target, error) {

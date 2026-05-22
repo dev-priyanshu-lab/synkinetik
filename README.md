@@ -80,7 +80,7 @@ SynKinetik currently targets:
 Install dependencies on macOS:
 
 ```bash
-brew install libpcap
+brew install libpcap redis
 go mod download
 ```
 
@@ -88,14 +88,14 @@ Install dependencies on Ubuntu 24.04:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config libpcap-dev
+sudo apt install -y build-essential pkg-config libpcap-dev redis-server
 go mod download
 ```
 
 Install dependencies on Rocky Linux:
 
 ```bash
-sudo dnf install -y gcc pkgconf-pkg-config libpcap-devel
+sudo dnf install -y gcc pkgconf-pkg-config libpcap-devel redis
 go mod download
 ```
 
@@ -157,6 +157,29 @@ On Linux, you can also grant the binary the packet privileges it needs:
 sudo setcap cap_net_raw,cap_net_admin=eip ./synkinetik
 ./synkinetik -targets 8.8.8.8:53
 ```
+
+## DNS lookup integration
+
+The scanner now supports a dedicated subcommand-style interface for structured operation modes.
+
+```bash
+# run only the scanner
+go run . scan
+
+# run only the DNS lookup service
+go run . dnslookup -dns-lookup-config dnslookup/lookup.conf
+
+# run both scanner and DNS lookup together
+go run . all -dns-lookup-config dnslookup/lookup.conf
+```
+
+Existing flags still work without subcommands, for example:
+
+```bash
+go run . -mode dnslookup -dns-lookup-config dnslookup/lookup.conf
+```
+
+When no config path is provided, the embedded DNS lookup service will fall back to the system default at `/etc/synkinetik/lookup.conf`.
 
 Expected behavior:
 
