@@ -1,6 +1,6 @@
 # SynKinetik
 
-SynKinetik is a high-performance asynchronous TCP SYN scanner prototype for macOS Apple Silicon. It separates raw packet injection, packet capture, and service verification into independent loops so each stage can be tuned without blocking the others.
+SynKinetik is a high-performance asynchronous TCP SYN scanner prototype for macOS and Linux, including Ubuntu 24.04 and Rocky Linux. It separates raw packet injection, packet capture, and service verification into independent loops so each stage can be tuned without blocking the others.
 
 This project is intended for authorized security testing only. Run it only against systems you own or have explicit permission to assess.
 
@@ -19,13 +19,13 @@ The current repository is a compact `package main` prototype. The major componen
 
 | File | Purpose |
 | --- | --- |
-| `main.go` | Starts cancellation handling, worker pool, receiver loop, and sender loop. |
+| `main.go` | Parses CLI configuration, starts cancellation handling, worker pool, receiver loop, and sender loop. |
 | `tcp.go` | Builds raw IPv4/TCP SYN packets with `gopacket`. |
 | `sender.go` | Opens a raw socket and sends crafted packets. |
 | `listener.go` | Captures SYN-ACK packets using pcap and a BPF filter. |
 | `banner.go` | Runs concurrent workers that verify open targets with `net.DialTimeout`. |
 | `target.go` | Defines the target IP and port model. |
-| `build.sh` | Builds the binary with Homebrew CGO include and library paths. |
+| `build.sh` | Builds the binary with platform-aware libpcap flags. |
 
 ## Architecture Flow
 
@@ -70,18 +70,32 @@ WorkerPool
 
 SynKinetik currently targets:
 
-- macOS on Apple Silicon.
+- macOS on Apple Silicon or Intel.
+- Linux distributions with raw socket and libpcap support, including Ubuntu 24.04 and Rocky Linux.
 - Go installed.
-- Homebrew installed under `/opt/homebrew`.
-- `libpcap` headers and libraries available through Homebrew or the macOS toolchain.
+- `libpcap` headers and libraries available through the OS package manager or the macOS toolchain.
 - Permission to open raw sockets and pcap capture handles.
-- A valid network interface name, currently hardcoded as `en0` in `main.go`.
-- A valid local source IP, currently hardcoded as `192.168.1.100` in `main.go`.
+- A valid non-loopback IPv4 network interface. SynKinetik auto-detects one by default, or you can pass it with `-iface`.
 
-Install common dependencies:
+Install dependencies on macOS:
 
 ```bash
-brew install libpcap
+brew install libpcap redis
+go mod download
+```
+
+Install dependencies on Ubuntu 24.04:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libpcap-dev redis-server
+go mod download
+```
+
+Install dependencies on Rocky Linux:
+
+```bash
+sudo dnf install -y gcc pkgconf-pkg-config libpcap-devel redis
 go mod download
 ```
 
@@ -96,31 +110,37 @@ Use the included build script:
 The script runs:
 
 ```bash
-CGO_CFLAGS="-I/opt/homebrew/include" \
-CGO_LDFLAGS="-L/opt/homebrew/lib" \
 go build -o synkinetik .
 ```
 
+On macOS, the script adds Homebrew include/library paths when `/opt/homebrew` exists. On Linux, it uses `pkg-config libpcap` when available.
+
 ## Configure Before Running
 
-Edit `main.go` before a live test:
+SynKinetik now accepts runtime flags:
 
-```go
-iface := "en0"
-srcIP := net.ParseIP("192.168.1.100")
-testTargets := []Target{{IP: net.ParseIP("8.8.8.8"), Port: 53}}
+```bash
+./synkinetik \
+  -iface eth0 \
+  -src-ip 192.168.1.100 \
+  -listen-port 44321 \
+  -targets 8.8.8.8:53,1.1.1.1:80 \
+  -workers 50
 ```
 
-Recommended changes:
+All flags are optional except `-targets` if you want to scan anything other than the default `8.8.8.8:53`.
 
-- Set `iface` to your active network interface.
-- Set `srcIP` to the real IPv4 address assigned to that interface.
-- Set `testTargets` to a host and port you are authorized to scan.
+- `-iface`: capture interface. Auto-detected when omitted.
+- `-src-ip`: local IPv4 source address. Auto-detected from the interface when omitted.
+- `-listen-port`: local TCP source port used for crafted SYN packets.
+- `-targets`: comma-separated IPv4 targets in `host:port` format.
+- `-workers`: number of TCP verification workers.
 
-Find your interface and IP on macOS:
+Find your interface and IP on macOS or Linux:
 
 ```bash
 ifconfig
+ip addr
 ```
 
 ## Run
@@ -130,6 +150,36 @@ Raw sockets and pcap usually require elevated privileges:
 ```bash
 sudo ./synkinetik
 ```
+
+On Linux, you can also grant the binary the packet privileges it needs:
+
+```bash
+sudo setcap cap_net_raw,cap_net_admin=eip ./synkinetik
+./synkinetik -targets 8.8.8.8:53
+```
+
+## DNS lookup integration
+
+The scanner now supports a dedicated subcommand-style interface for structured operation modes.
+
+```bash
+# run only the scanner
+go run . scan
+
+# run only the DNS lookup service
+go run . dnslookup -dns-lookup-config dnslookup/lookup.conf
+
+# run both scanner and DNS lookup together
+go run . all -dns-lookup-config dnslookup/lookup.conf
+```
+
+Existing flags still work without subcommands, for example:
+
+```bash
+go run . -mode dnslookup -dns-lookup-config dnslookup/lookup.conf
+```
+
+When no config path is provided, the embedded DNS lookup service will fall back to the system default at `/etc/synkinetik/lookup.conf`.
 
 Expected behavior:
 
@@ -173,7 +223,7 @@ Live sender and receiver testing needs root privileges and a real network target
 In one terminal, run a packet capture:
 
 ```bash
-sudo tcpdump -i en0 'tcp port 44321'
+sudo tcpdump -i eth0 'tcp port 44321'
 ```
 
 In another terminal, run SynKinetik:
@@ -186,19 +236,18 @@ For a safer first integration test, use a host you control on your LAN with a kn
 
 ## Current Limitations
 
-- Interface, source IP, source port, and targets are currently hardcoded in `main.go`.
+- Target parsing currently supports comma-separated IPv4 `host:port` values only.
 - The sender does not yet implement rate limiting.
 - The TCP sequence number and IP ID are static.
 - Banner fingerprinting is currently a verification stub.
 - The pcap filter currently checks for ACK and the Go code checks for SYN plus ACK.
-- There is no CLI argument parsing yet.
 - There are no automated tests checked in yet.
 
 ## Next Enhancements
 
 Useful next implementation steps:
 
-- Add CLI flags for interface, source IP, target host/range, port list, and concurrency.
+- Add CIDR/range expansion and richer port list parsing.
 - Add a unit test suite for `BuildSYN`.
 - Add rate limiting and jitter for the sender loop.
 - Randomize source port, TCP sequence number, and IP ID where appropriate.
